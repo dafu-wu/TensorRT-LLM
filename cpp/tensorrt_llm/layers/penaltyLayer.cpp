@@ -154,6 +154,9 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto setupParams = std::dynamic_pointer_cast<DynamicDecodeSetupParams>(baseSetupParams);
+    if (!setupParams) {
+        std::cerr << "Dynamic cast failed." << std::endl;
+    }
 
     if (mConfiguredBeamWidth == -1)
     {
@@ -173,7 +176,7 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, SizeType
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getMaxBatchSize(), mStream};
 
     auto const& penaltyParams = setupParams->penaltyParams;
-
+    
     bool const useTemperature = penaltyParams.temperature.has_value();
     bool const useRepetitionPenalty = penaltyParams.repetitionPenalty.has_value();
     bool const usePresencePenalty = penaltyParams.presencePenalty.has_value();

@@ -89,10 +89,13 @@ public:
         temperature = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].temperature; },
             layers::DefaultDecodingParams::getTemperature());
-        if (temperature.has_value() && temperature.value().front() <= 1e-5)
+
+        if (temperature.has_value() && !temperature.value().empty() && temperature.value().front() <= 1e-5)
         {
-            temperature.value().front() = 1e-4;
+            auto& tempVec = temperature.value(); 
+            tempVec.front() = 1e-4;
         }
+
         minLength = fuseValues<SizeType32>(
             configs, [&configs](size_t ci) { return configs[ci].minLength; },
             layers::DefaultDecodingParams::getMinLength());
