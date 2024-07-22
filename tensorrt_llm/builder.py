@@ -260,6 +260,9 @@ class Builder():
                                 round(opt_shape[dim] / shard_num))
                             max_shape[dim] = int(
                                 math.ceil(max_shape[dim] / shard_num))
+                min_shape = trt.Dims([int(x) for x in min_shape])
+                opt_shape = trt.Dims([int(x) for x in opt_shape])
+                max_shape = trt.Dims([int(x) for x in max_shape])
                 profile.set_shape(input_name, min_shape, opt_shape, max_shape)
                 logger.debug(
                     f'{input_name}, min: {min_shape}, opt: {opt_shape}, max: {max_shape}, dimension names: {shape_profile.dimension_names}'
