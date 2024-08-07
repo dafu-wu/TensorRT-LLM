@@ -1452,8 +1452,13 @@ class SmoothQuantAttention(Module):
         self.rotary_embedding_dim = 0
 
         if rotary_embedding_scaling is not None:
-            self.rotary_embedding_scale_type = RotaryScalingType.from_string(
-                rotary_embedding_scaling["type"])
+            if 'type' in rotary_embedding_scaling:
+                self.rotary_embedding_scale_type = RotaryScalingType.from_string(rotary_embedding_scaling["type"])
+            elif "rope_type" in rotary_embedding_scaling:
+                self.rotary_embedding_scale_type = RotaryScalingType.from_string(rotary_embedding_scaling["rope_type"])
+            else:
+                raise ValueError("rope_scaling must have a 'type' or 'rope_type' key.")
+
             self.rotary_embedding_scale = rotary_embedding_scaling.get(
                 "factor", 1.0)
             assert self.rotary_embedding_scale > 1.0
