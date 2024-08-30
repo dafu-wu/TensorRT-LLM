@@ -19,10 +19,10 @@ from typing import List, Optional, Union
 
 import torch
 
-import tensorrt_llm.bindings.executor as trtllm
-
 from .. import profiler
-from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
+from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
+                        WorldConfig)
+from ..bindings import executor as trtllm
 from ..logger import logger
 from ..mapping import Mapping
 from .generation import LogitsProcessor, SamplingConfig, StoppingCriteria
@@ -47,7 +47,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
     def __init__(self, executor: trtllm.Executor, max_batch_size: int,
                  max_input_len: int, max_seq_len: int, max_beam_width: int,
-                 model_config: ModelConfig, world_config: WorldConfig) -> None:
+                 model_config: ModelConfig, world_config: WorldConfig,
+                 use_kv_cache: bool) -> None:
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
@@ -61,29 +62,34 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                tp_size=world_config.tensor_parallelism,
                                pp_size=world_config.pipeline_parallelism)
         self.world_config = world_config
+        self.use_kv_cache = use_kv_cache
 
     @classmethod
-    def from_dir(cls,
-                 engine_dir: str,
-                 *,
-                 lora_dir: Optional[str] = None,
-                 rank: int = 0,
-                 max_batch_size: Optional[int] = None,
-                 max_input_len: Optional[int] = None,
-                 max_output_len: Optional[int] = None,
-                 max_beam_width: Optional[int] = None,
-                 max_attention_window_size: Optional[int] = None,
-                 sink_token_length: Optional[int] = None,
-                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-                 medusa_choices: list[list[int]] | None = None,
-                 debug_mode: bool = False,
-                 lora_ckpt_source: str = "hf",
-                 gpu_weights_percent: float = 1,
-                 max_tokens_in_paged_kv_cache: int | None = None,
-                 kv_cache_enable_block_reuse: bool = False,
-                 enable_chunked_context: bool = False,
-                 is_enc_dec: bool = False,
-                 multi_block_mode: Optional[bool] = None) -> 'ModelRunnerCpp':
+    def from_dir(
+        cls,
+        engine_dir: str,
+        *,
+        lora_dir: Optional[str] = None,
+        rank: int = 0,
+        max_batch_size: Optional[int] = None,
+        max_input_len: Optional[int] = None,
+        max_output_len: Optional[int] = None,
+        max_beam_width: Optional[int] = None,
+        max_attention_window_size: Optional[list[int]] = None,
+        sink_token_length: Optional[int] = None,
+        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+        medusa_choices: list[list[int]] | None = None,
+        lookahead_config: list[int] | None = None,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        gpu_weights_percent: float = 1,
+        max_tokens_in_paged_kv_cache: int | None = None,
+        kv_cache_enable_block_reuse: bool = False,
+        enable_chunked_context: bool = False,
+        is_enc_dec: bool = False,
+        multi_block_mode: Optional[bool] = None,
+        enable_context_fmha_fp32_acc: Optional[bool] = None
+    ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -110,7 +116,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 The runtime beam width limit. If max_beam_width is not None, it should not
                 be larger than the engine's max_beam_width; otherwise, the engine's max_beam_width
                 will be used.
-            max_attention_window_size (int):
+            max_attention_window_size (List[int]):
                 The attention window size that controls the sliding window attention / cyclic kv cache behavior.
             sink_token_length (int) :
                 The sink token length, default=0.
@@ -132,9 +138,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Whether the model is encoder-decoder architecture.
             multi_block_mode (bool):
                 Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
+            enable_context_fmha_fp32_acc (bool):
+                Enable FMHA runner FP32 accumulation.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
+        extended_runtime_perf_knob_config = trtllm.ExtendedRuntimePerfKnobConfig(
+        )
+        if multi_block_mode is not None:
+            extended_runtime_perf_knob_config.multi_block_mode = multi_block_mode
+        if enable_context_fmha_fp32_acc is not None:
+            extended_runtime_perf_knob_config.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
 
         if is_enc_dec:
             encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
@@ -143,6 +157,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
             decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
             decoder_model_config = decoder_json_config.model_config
+            use_kv_cache = decoder_model_config.kv_cache_type != KVCacheType.DISABLED
+
+            if not use_kv_cache:
+                assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
             tp_size = decoder_json_config.tensor_parallelism
             pp_size = decoder_json_config.pipeline_parallelism
@@ -165,7 +183,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Path(engine_dir) / "decoder", trtllm.ModelType.ENCODER_DECODER,
                 trtllm.ExecutorConfig(max_beam_width=max_beam_width,
                                       kv_cache_config=kv_cache_config,
-                                      gpu_weights_percent=gpu_weights_percent))
+                                      gpu_weights_percent=gpu_weights_percent,
+                                      extended_runtime_perf_knob_config=
+                                      extended_runtime_perf_knob_config))
 
             profiler.stop('load tensorrt_llm engine')
 
@@ -179,11 +199,16 @@ class ModelRunnerCpp(ModelRunnerMixin):
                        max_seq_len=max_input_len + max_output_len,
                        max_beam_width=max_beam_width,
                        model_config=decoder_model_config,
-                       world_config=world_config)
+                       world_config=world_config,
+                       use_kv_cache=use_kv_cache)
 
         config_path = Path(engine_dir) / "config.json"
         json_config = GptJsonConfig.parse_file(config_path)
         model_config = json_config.model_config
+        use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
+
+        if not use_kv_cache:
+            assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
 
         # Note: Parallel configuration will be fetched automatically from trtllm.Executor constructor
         # by inspecting the json file. These lines serve the purpose of serving vocab_size_padded and
@@ -211,6 +236,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if multi_block_mode is not None:
                 multi_block_mode = False  # Medusa doesn't support multi-block mode.
 
+        if lookahead_config is not None:
+            [w, n, g] = lookahead_config
+            decoding_config.lookahead_decoding_config = trtllm.LookaheadDecodingConfig(
+                w, n, g)
+
         if max_batch_size is None:
             max_batch_size = model_config.max_batch_size
         else:
@@ -237,8 +267,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config=decoding_config,
             gpu_weights_percent=gpu_weights_percent)
         trtllm_config.enable_chunked_context = enable_chunked_context
-        if multi_block_mode is not None:
-            trtllm_config.multi_block_mode = multi_block_mode
+        trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
+
         executor = trtllm.Executor(engine_dir, trtllm.ModelType.DECODER_ONLY,
                                    trtllm_config)
 
@@ -253,7 +283,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                    max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    model_config=model_config,
-                   world_config=world_config)
+                   world_config=world_config,
+                   use_kv_cache=use_kv_cache)
 
     def _check_inputs(self, batch_input_ids: List[List[int]],
                       sampling_config: trtllm.SamplingConfig, max_new_tokens):
@@ -323,28 +354,32 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def gather_generation_logits(self) -> bool:
         return self.model_config.compute_generation_logits
 
-    def generate(self,
-                 batch_input_ids: List[torch.Tensor],
-                 *,
-                 encoder_input_ids: List[torch.Tensor] = None,
-                 sampling_config: Optional[SamplingConfig] = None,
-                 lora_uids: Optional[list] = None,
-                 streaming: bool = False,
-                 stopping_criteria: Optional[StoppingCriteria] = None,
-                 logits_processor: Optional[LogitsProcessor] = None,
-                 max_new_tokens: int = 1,
-                 end_id: int | None = None,
-                 pad_id: int | None = None,
-                 bad_words_list: list[list[int]] | None = None,
-                 stop_words_list: list[list[int]] | None = None,
-                 return_dict: bool = False,
-                 output_sequence_lengths: bool = False,
-                 output_log_probs: bool = False,
-                 output_cum_log_probs: bool = False,
-                 prompt_table: Optional[Union[str, torch.Tensor]] = None,
-                 prompt_tasks: Optional[str] = None,
-                 return_all_generated_tokens: bool = False,
-                 **kwargs) -> Union[torch.Tensor, dict]:
+    def generate(
+            self,
+            batch_input_ids: List[torch.Tensor],
+            *,
+            encoder_input_ids: List[torch.Tensor] = None,
+            encoder_input_features: List[
+                torch.Tensor] = None,  # TODO: add to doc string
+            encoder_output_lengths: List[int] = None,
+            sampling_config: Optional[SamplingConfig] = None,
+            lora_uids: Optional[list] = None,
+            streaming: bool = False,
+            stopping_criteria: Optional[StoppingCriteria] = None,
+            logits_processor: Optional[LogitsProcessor] = None,
+            max_new_tokens: int = 1,
+            end_id: int | None = None,
+            pad_id: int | None = None,
+            bad_words_list: list[list[int]] | None = None,
+            stop_words_list: list[list[int]] | None = None,
+            return_dict: bool = False,
+            output_sequence_lengths: bool = False,
+            output_log_probs: bool = False,
+            output_cum_log_probs: bool = False,
+            prompt_table: Optional[Union[str, torch.Tensor]] = None,
+            prompt_tasks: Optional[str] = None,
+            return_all_generated_tokens: bool = False,
+            **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
         The generation-controlling parameters are set in the sampling_config; it will be set to a default one if not passed.
@@ -353,6 +388,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
         Args:
             batch_input_ids (List[torch.Tensor]):
                 A list of input id tensors. Each tensor is of shape (sequence_length, ).
+            encoder_input_ids (List[torch.Tensor]):
+                A list of encoder input id tensors for encoder-decoder models (optional). Each tensor is of shape (sequence_length, ).
+            encoder_input_features: (List[torch.Tensor]):
+                A list of encoder input feature tensors for multimodal encoder-decoder models (optional). Each tensor is of shape (sequence_length, feature_dim).
+            encoder_output_lengths: (List[int]):
+                A list of encoder output lengths (optional) if encoder output has different length from encoder input (due to convolution down-sampling, etc.)
             sampling_config (SamplingConfig):
                 The sampling configuration to be used as base parametrization for the generation call.
                 The passed **kwargs matching the sampling_config's attributes will override them.
@@ -391,6 +432,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if logits_processor is not None:
             raise RuntimeError(
                 "Logits processor is not supported in C++ session.")
+
+        if not self.use_kv_cache and max_new_tokens > 1:
+            raise RuntimeError(
+                'Disabled KV cache is intended for context phase only now.')
 
         # If we are in a multi-gpu scenario, only rank 0 continues
         if not self.session.can_enqueue_requests():
@@ -449,6 +494,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 input_token_ids=input_ids,
                 encoder_input_token_ids=encoder_input_ids_list[i]
                 if encoder_input_ids is not None else None,
+                encoder_output_length=encoder_output_lengths[i]
+                if encoder_output_lengths is not None else None,
+                encoder_input_features=encoder_input_features[i].contiguous()
+                if encoder_input_features is not None else None,
                 max_new_tokens=max_new_tokens,
                 pad_id=pad_id,
                 end_id=end_id,
@@ -466,17 +515,18 @@ class ModelRunnerCpp(ModelRunnerMixin):
         ]
 
         request_ids = self.session.enqueue_requests(requests)
-
         if not streaming:
-            return self._initialize_and_fill_output(
-                request_ids, end_id, return_dict, output_sequence_lengths,
-                output_log_probs, output_cum_log_probs, batch_input_ids,
-                streaming, return_all_generated_tokens)
+            return self._initialize_and_fill_output(request_ids, end_id,
+                                                    return_dict,
+                                                    output_sequence_lengths,
+                                                    output_log_probs,
+                                                    output_cum_log_probs,
+                                                    batch_input_ids, streaming)
         else:
             return self._stream(request_ids, end_id, return_dict,
                                 output_sequence_lengths, output_log_probs,
                                 output_cum_log_probs, batch_input_ids,
-                                streaming, batch_input_ids_list,
+                                batch_input_ids_list, streaming,
                                 return_all_generated_tokens)
 
     def _prepare_words_list(self, words_list: List[List[List[int]]],
@@ -511,7 +561,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def _initialize_and_fill_output(self, request_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
-                                    streaming, return_all_generated_tokens):
+                                    streaming):
         output_ids = [[] for _ in range(len(request_ids))]
         for reqid_pos in range(len(request_ids)):
             output_ids[reqid_pos] = [[] for _ in range(self.max_beam_width)]
@@ -523,13 +573,12 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         return self._fill_output(responses, output_ids, end_id, return_dict,
                                  output_sequence_lengths, output_log_probs,
-                                 output_cum_log_probs, batch_input_ids,
-                                 streaming, request_ids,
-                                 return_all_generated_tokens)
+                                 output_cum_log_probs, batch_input_ids, [],
+                                 streaming, request_ids, False)
 
     def _stream(self, request_ids, end_id, return_dict, output_sequence_lengths,
                 output_log_probs, output_cum_log_probs, batch_input_ids,
-                streaming, batch_input_ids_list, return_all_generated_tokens):
+                batch_input_ids_list, streaming, return_all_generated_tokens):
         output_ids = [[] for _ in range(len(request_ids))]
         for reqid_pos in range(len(request_ids)):
             output_ids[reqid_pos] = [
@@ -548,13 +597,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
             yield self._fill_output(responses, output_ids, end_id, return_dict,
                                     output_sequence_lengths, output_log_probs,
                                     output_cum_log_probs, batch_input_ids,
-                                    streaming, request_ids,
-                                    return_all_generated_tokens)
+                                    batch_input_ids_list, streaming,
+                                    request_ids, return_all_generated_tokens)
 
     def _fill_output(self, responses, output_ids, end_id, return_dict,
                      output_sequence_lengths, output_log_probs,
-                     output_cum_log_probs, batch_input_ids, streaming,
-                     request_ids, return_all_generated_tokens):
+                     output_cum_log_probs, batch_input_ids,
+                     batch_input_ids_list, streaming, request_ids,
+                     return_all_generated_tokens):
         cuda_device = torch.device("cuda")
 
         for response in responses:
@@ -565,7 +615,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             for beam, output_tokens in enumerate(
                     response.result.output_token_ids):
                 if return_all_generated_tokens:
-                    output_ids[reqid_pos][beam] = output_tokens
+                    output_ids[reqid_pos][
+                        beam] = batch_input_ids_list[reqid_pos] + output_tokens
                 else:
                     output_ids[reqid_pos][beam] += output_tokens
 

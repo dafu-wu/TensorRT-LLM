@@ -85,6 +85,10 @@ select better kernels.
 
 However, this feature will increase the engine build time.
 
+**Known issue**: We observed that enabling multiple profiles can lead to extra
+unexpected GPU memory usage on some cases starting from v0.11. The issue will be
+addressed in future releases.
+
 ### GPT Attention Plugin and Context Fused Multi-Head Attention
 
 The GPT attention plugin and fused  multi-head attention kernel are enabled by
@@ -201,7 +205,7 @@ downside is slight reduction of accuracy because one of the quantization scaling
 factors are discarded.
 
 If both model and batch sizes are large, it is recommended to enable the feature
-by using the `--use_fused_mlp` argument with `trtllm-build`. When the workload
+by using the `--use_fused_mlp=enable` argument with `trtllm-build`. When the workload
 is very small, or if you're using FP8 PTQ and the accuracy after enabling it
 does not satisfy your requirement, it is not recommended to enable that feature.
 
@@ -213,7 +217,7 @@ the downside is slight reduction of accuracy because one of the quantization
 scaling factors are discarded.
 
 If model is large and you are running it on Hopper with FP8 precision, it is
-recommended to enable the feature by using the `--use_fused_mlp --gemm_swiglu_plugin fp8`
+recommended to enable the feature by using the `--use_fused_mlp=enable --gemm_swiglu_plugin fp8`
 argument with `trtllm-build`. When the workload is very small, or the accuracy
 after enabling it does not satisfy your requirement, it is not recommended to
 enable that feature.

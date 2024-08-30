@@ -198,6 +198,7 @@ class Tensor(object):
         # using strong reference will likely cause significant peak memory increase, since Network objects
         # holds the weights data.
         self._network = weakref.ref(default_net())
+        self.is_network_input = is_network_input
         if is_network_input:
             if dim_range is not None:
                 assert isinstance(dim_range, OrderedDict)
@@ -682,9 +683,11 @@ class PositionEmbeddingType(IntEnum):
 class AttentionMaskType(IntEnum):
     padding = 0
     causal = 1
-    bidirectional = 2
-    bidirectionalglm = 3  # TODO: merge this mask into bidirectional
-    blocksparse = 4
+    sliding_window_causal = 2
+    bidirectional = 3
+    bidirectionalglm = 4  # TODO: merge this mask into bidirectional
+    blocksparse = 5
+    custom_mask = 6
 
 
 class LayerNormType(IntEnum):
@@ -3706,7 +3709,6 @@ def create_allreduce_plugin(
     strategy: AllReduceStrategy,
     dtype: trt.DataType,
     config: AllReduceConfig,
-    counter: int,
     reduce_fusion_params: AllReduceFusionParams,
 ):
     allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
@@ -3727,9 +3729,6 @@ def create_allreduce_plugin(
         "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_fusion_op)
-    p_counter = trt.PluginField("counter", np.array([counter], np.int32),
-                                trt.PluginFieldType.INT32)
-    pfc.append(p_counter)
     p_eps = trt.PluginField(
         "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
@@ -3805,10 +3804,8 @@ def allreduce(
         strategy = AllReduceStrategy.NCCL
 
     workspace = None
-    counter = 0
     if strategy != AllReduceStrategy.NCCL:
         workspace = current_all_reduce_helper().workspace.trt_tensor
-        counter = current_all_reduce_helper().gen_id()
 
     if reduce_fusion_params is None:
         reduce_fusion_params = AllReduceFusionParams()
@@ -3822,7 +3819,6 @@ def allreduce(
         strategy=strategy,
         dtype=str_dtype_to_trt(dtype),
         config=config,
-        counter=counter,
         reduce_fusion_params=reduce_fusion_params,
     )
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
@@ -4481,6 +4477,7 @@ def gpt_attention(
     *,
     qkv: Tensor,
     past_key_value: Tensor,
+    context_fmha_custom_mask: Optional[Tensor] = None,
     sequence_length: Tensor,
     host_past_key_value_lengths: Optional[Tensor],
     host_max_attention_window_sizes: Tensor,
@@ -4562,6 +4559,10 @@ def gpt_attention(
             in contiguous mode and
             [max_blocks, 2, num_kv_heads, num_tokens_per_block, hidden_dim_per_head]
             in paged mode. See KV Cache in docs/gpt_attention.md,
+
+        context_fmha_custom_mask: Tensor (On GPU)
+            The tensor that stores the packed custom mask for fmha.
+            Its shape is [num_tokens, max_kv_seqlen / 32].
 
         sequence_lengths: Tensor (On GPU)
             The tensor that stores the length of each sequence. Its shape is
@@ -4674,9 +4675,11 @@ def gpt_attention(
             The type of mask:
                 * tensorrt_llm.layers.AttentionMaskType.padding for BERT,
                 * tensorrt_llm.layers.AttentionMaskType.causal for GPT,
+                * tensorrt_llm.layers.AttentionMaskType.sliding_window_causal for GPT,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectional for ChatGLM-6B,
                 * tensorrt_llm.layers.AttentionMaskType.bidirectionalglm for GLM-10B,
                 * tensorrt_llm.layers.AttentionMaskType.blocksparse for Phi-3-small,
+                * tensorrt_llm.layers.AttentionMaskType.custom_mask for any models.
 
         block_sparse_block_size: int
             Block size in block sparse attention
@@ -4879,6 +4882,9 @@ def gpt_attention(
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
         trt.PluginFieldType.INT32)
+    # reset mask_type to custom_mask.
+    if context_fmha_custom_mask is not None:
+        mask_type = AttentionMaskType.custom_mask
     mask_type = trt.PluginField("mask_type", np.array([int(mask_type)],
                                                       np.int32),
                                 trt.PluginFieldType.INT32)
@@ -4907,8 +4913,7 @@ def gpt_attention(
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     kv_cache_quant_mode_field = trt.PluginField(
-        "kv_cache_quant_mode",
-        np.array(np.int8(kv_cache_quant_mode), dtype=np.int32),
+        "kv_cache_quant_mode", np.array(kv_cache_quant_mode, dtype=np.int32),
         trt.PluginFieldType.INT32)
     paged_kv_cache = trt.PluginField(
         "paged_kv_cache", np.array(paged_kv_cache_flag, dtype=np.int32),
@@ -4975,7 +4980,10 @@ def gpt_attention(
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
+    assert attn_plug
     plug_inputs = [*qkv] if is_unfuse_qkv_gemm else [qkv]
+    if context_fmha_custom_mask is not None:
+        plug_inputs += [context_fmha_custom_mask]
     if use_cache:
         plug_inputs += [
             sequence_length,
@@ -5510,7 +5518,6 @@ def lora_plugin(
     transa: bool = False,
     transb: bool = False,
     host_context_lengths: Tensor = None,  # for pad-free input mode
-    max_context_length: int = 0,
     max_low_rank: int = 0,
     lora_ranks: List[Tensor] = None,
     lora_weights_pointers: List[Tensor] = None,
@@ -5518,8 +5525,8 @@ def lora_plugin(
 ):
     '''
     Parameters:
-        lora_ids : cpu Tensor = None
-            A tensor that contains the lora ids of different inputs.
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding
 
         in_hidden_size/out_hidden_size : int
             the lora computation workflow is
@@ -5540,9 +5547,6 @@ def lora_plugin(
 
         host_context_lengths: cpu Tensor = None
             A host tensor that contains the lengths of the different inputs,
-
-        max_context_length : int
-            Maximum length during context phase, used to determine the workspace size.
 
         max_low_rank : int
             Maximum low_rank, used to determine the workspace size.
@@ -5591,9 +5595,6 @@ def lora_plugin(
         "remove_input_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
-    max_context_length_field = trt.PluginField(
-        "max_context_length", np.array(max_context_length, dtype=np.int32),
-        trt.PluginFieldType.INT32)
     max_low_rank_field = trt.PluginField("max_low_rank",
                                          np.array(max_low_rank, dtype=np.int32),
                                          trt.PluginFieldType.INT32)
@@ -5607,8 +5608,7 @@ def lora_plugin(
 
     pfc = trt.PluginFieldCollection([
         in_hidden_size_field, transa, transb, num_lora_modules_field, pf_type,
-        remove_input_padding, max_context_length_field, max_low_rank_field,
-        weight_index_field
+        remove_input_padding, max_low_rank_field, weight_index_field
     ] + out_hidden_size_field_list)
     lora_plug = plg_creator.create_plugin("lora", pfc)
 

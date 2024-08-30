@@ -43,7 +43,10 @@ public:
         executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
         std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
         std::optional<SizeType32> maxNumTokens = std::nullopt,
-        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{}, bool multiBlockMode = false)
+        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{},
+        executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
+        = executor::ExtendedRuntimePerfKnobConfig{},
+        std::optional<executor::DebugConfig> debugConfig = std::nullopt)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(deviceIds)
@@ -56,7 +59,8 @@ public:
         , maxBatchSize(maxBatchSize)
         , maxNumTokens(maxNumTokens)
         , schedulerConfig{schedulerConfig}
-        , multiBlockMode(multiBlockMode)
+        , extendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
+        , debugConfig{std::move(debugConfig)}
     {
     }
 
@@ -67,16 +71,36 @@ public:
             PeftCacheManagerConfig(executorConfig.getPeftCacheConfig().value_or(executor::PeftCacheConfig())),
             executorConfig.getDecodingConfig().value_or(executor::DecodingConfig{}),
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
-            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(), executorConfig.getMultiBlockMode())
+            executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
+            executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig())
+    {
+    }
+
+    // Copy constructor
+    TrtGptModelOptionalParams(TrtGptModelOptionalParams const& other)
+        : TrtGptModelOptionalParams(other.kvCacheConfig, other.enableTrtOverlap, other.deviceIds,
+            other.normalizeLogProbs, other.enableChunkedContext, other.peftCacheManagerConfig, other.decodingConfig,
+            other.gpuWeightsPercent, other.maxBeamWidth, other.maxBatchSize, other.maxNumTokens, other.schedulerConfig,
+            other.extendedRuntimePerfKnobConfig)
     {
     }
 
     bool operator==(TrtGptModelOptionalParams const& other) const
     {
-        return kvCacheConfig == other.kvCacheConfig && enableTrtOverlap == other.enableTrtOverlap
-            && deviceIds == other.deviceIds && normalizeLogProbs == other.normalizeLogProbs
-            && enableChunkedContext == other.enableChunkedContext && decodingConfig == other.decodingConfig
-            && gpuWeightsPercent == other.gpuWeightsPercent && multiBlockMode == other.multiBlockMode;
+        return kvCacheConfig == other.kvCacheConfig                                 //
+            && enableTrtOverlap == other.enableTrtOverlap                           //
+            && deviceIds == other.deviceIds                                         //
+            && normalizeLogProbs == other.normalizeLogProbs                         //
+            && enableChunkedContext == other.enableChunkedContext                   //
+            && decodingConfig == other.decodingConfig                               //
+            && gpuWeightsPercent == other.gpuWeightsPercent                         //
+            && maxBeamWidth == other.maxBeamWidth                                   //
+            && maxBatchSize == other.maxBatchSize                                   //
+            && maxNumTokens == other.maxNumTokens                                   //
+            && schedulerConfig == other.schedulerConfig                             //
+            && extendedRuntimePerfKnobConfig == other.extendedRuntimePerfKnobConfig //
+            && debugConfig == other.debugConfig                                     //
+            ;
     }
 
     friend std::ostream& operator<<(std::ostream& os, TrtGptModelOptionalParams const& self);
@@ -95,7 +119,8 @@ public:
     std::optional<SizeType32> maxBatchSize;
     std::optional<SizeType32> maxNumTokens;
     executor::SchedulerConfig schedulerConfig;
-    bool multiBlockMode;
+    executor::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig;
+    std::optional<executor::DebugConfig> debugConfig;
 };
 
 } // namespace tensorrt_llm::batch_manager

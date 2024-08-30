@@ -1086,7 +1086,7 @@ def convert_hf_qwen(hf_model,
     if mapping.is_last_pp_rank():
         if hf_model.config.tie_word_embeddings:
             # lm_head.weight has the same weights as embedding
-            lm_head_weights = v
+            lm_head_weights = v.clone()
         else:
             lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
@@ -1124,41 +1124,6 @@ def convert_hf_qwen(hf_model,
     return weights
 
 
-def smooth_quant(model,
-                 qwen_type,
-                 model_dir,
-                 calib_dataset='cnn_dailymail',
-                 smoothquant: Optional[float] = None):
-    assert model is not None
-    act_range = {}
-    qwen_qkv_para = {}
-    # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    qwen_smoother = {}
-
-    os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
-        "TOKENIZERS_PARALLELISM", "false")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                              trust_remote_code=True,
-                                              use_fast=False,
-                                              padding_side='left')
-    dataset = load_calib_dataset(calib_dataset)
-    system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
-    gen_config_path = os.path.join(model_dir, 'generation_config.json')
-    with open(gen_config_path, 'r') as f:
-        gen_config = json.load(f)
-    chat_format = getattr(gen_config, 'chat_format', 'chatml')
-    act_range = capture_activation_range(model, qwen_type, tokenizer, dataset,
-                                         system_prompt, chat_format)
-    if smoothquant is not None:
-        if qwen_type == 'qwen':
-            smooth_qwen_model(model, act_range, smoothquant, qwen_qkv_para,
-                              qwen_smoother)
-        else:
-            smooth_qwen2_model(model, act_range, smoothquant, qwen_qkv_para,
-                               qwen_smoother)
-    return act_range, qwen_qkv_para, qwen_smoother
-
-
 def quantize(hf_model_dir: str,
              output_dir: str,
              config: QWenConfig,
@@ -1166,22 +1131,17 @@ def quantize(hf_model_dir: str,
     '''
         Quantize the save the model as TRT-LLM checkpoint to output_dir
     '''
-    #TODO: currently only smooth quant and kv cache quantization are supported, needs to support mode quant algorithm calling modelopt
-
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-        json.dump(config.to_dict(), f, indent=4)
+    os.makedirs(output_dir, exist_ok=True)
+    config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     mapping = config.mapping
-    assert mapping.rank == -1, "You shall call quantize only once in one rank, assert rank==-1 for precaution"
-    quant_config = config.quantization
+    assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
+    quant_config = config.quantization
     use_smooth_quant = quant_config.use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == "INT8"
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"
-    if use_smooth_quant:
-        assert quant_config.smoothquant_val is not None, "A smooth value must be specified when using smooth quant"
-
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
@@ -1191,9 +1151,31 @@ def quantize(hf_model_dir: str,
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
         trust_remote_code=True).half()
 
-    act_range, qkv_para, smoother = smooth_quant(hf_model, config.qwen_type,
-                                                 hf_model_dir, calib_dataset,
-                                                 quant_config.smoothquant_val)
+    os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
+        "TOKENIZERS_PARALLELISM", "false")
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_dir,
+                                              trust_remote_code=True,
+                                              use_fast=False,
+                                              padding_side='left')
+    dataset = load_calib_dataset(calib_dataset)
+
+    system_prompt = "You are a useful assistant, please directly output the corresponding summary according to the article entered by the user."
+    gen_config_path = os.path.join(hf_model_dir, 'generation_config.json')
+    with open(gen_config_path, 'r') as f:
+        gen_config = json.load(f)
+    chat_format = getattr(gen_config, 'chat_format', 'chatml')
+    act_range = capture_activation_range(hf_model, config.qwen_type, tokenizer,
+                                         dataset, system_prompt, chat_format)
+    qkv_para = {}
+    # smoother for inputs of self_attn.o_proj and mlp.down_proj
+    smoother = {}
+    if use_smooth_quant:
+        if config.qwen_type == 'qwen':
+            smooth_qwen_model(hf_model, act_range, quant_config.smoothquant_val,
+                              qkv_para, smoother)
+        else:
+            smooth_qwen2_model(hf_model, act_range,
+                               quant_config.smoothquant_val, qkv_para, smoother)
 
     for rank in range(mapping.world_size):
         # To avoid changing the mapping arg in-place, also the given mapping from caller is rank agnostic, since quantize is called from only one rank

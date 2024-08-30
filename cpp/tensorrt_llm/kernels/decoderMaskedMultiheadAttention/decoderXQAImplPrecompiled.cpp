@@ -113,8 +113,16 @@ public:
         unsigned int beam_width = xqaParams.beam_width;
         // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
         unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
-        // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-        unsigned int m_tilesize = xqaParams.multi_query_tokens ? 16 : num_q_heads_over_kv;
+        unsigned int m_tilesize;
+        if (xqaParams.multi_query_tokens)
+        {
+            // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
+            m_tilesize = xqaParams.generation_input_length <= 16 ? 16 : 32;
+        }
+        else
+        {
+            m_tilesize = num_q_heads_over_kv;
+        }
 
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
@@ -176,7 +184,6 @@ public:
         decoder_params.seqKVLengths = xqaParams.sequence_lengths;
         decoder_params.batchSize = int(batch_beam_size);
         decoder_params.maxQSeqLength = xqaParams.generation_input_length;
-        decoder_params.removePadding = xqaParams.multi_query_tokens;
         TLLM_CHECK_WITH_INFO(!xqaParams.multi_query_tokens || xqaParams.spec_decoding_generation_lengths != nullptr,
             "Spec_decoding_generation_lengths must be provided.");
         // Rotary embedding inv_freq buffer.
@@ -201,19 +208,17 @@ public:
             (float2 const*) nullptr, xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets,
             int(batch_beam_size), xqaParams.generation_input_length, xqaParams.timestep,
             xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
-            int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length), xqaParams.num_q_heads,
-            xqaParams.num_kv_heads, xqaParams.num_q_heads / xqaParams.num_kv_heads, xqaParams.head_size,
-            xqaParams.rotary_embedding_dim, xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type,
-            xqaParams.rotary_embedding_scale, xqaParams.rotary_embedding_max_positions,
-            xqaParams.position_embedding_type, xqaParams.position_shift_enabled, cache_type, true, false,
-            multiprocessor_count, xqaParams.rotary_vision_start, xqaParams.rotary_vision_length};
+            int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length),
+            /*remove_padding*/ true, xqaParams.num_q_heads, xqaParams.num_kv_heads,
+            xqaParams.num_q_heads / xqaParams.num_kv_heads, xqaParams.head_size, xqaParams.rotary_embedding_dim,
+            xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type, xqaParams.rotary_embedding_scale,
+            xqaParams.rotary_embedding_max_positions, xqaParams.position_embedding_type,
+            xqaParams.position_shift_enabled, cache_type, true, false, multiprocessor_count,
+            xqaParams.rotary_vision_start, xqaParams.rotary_vision_length};
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
         sync_check_cuda_error();
 
-        // Use mTileSize = 16 kernels when qSeqLen <= 16.
-        unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
-        unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
         XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
         auto const findIter = mFunctions.find(hash_key);
 
@@ -229,6 +234,9 @@ public:
             // MultiQueryTokens (generation_input_length > 1) need extra parameters (like qSeqLen, headGrpSize, and
             // mask). Input parameters for MultiQueryTokens kernels.
             unsigned int headGrpSize = num_q_heads_over_kv;
+            // Use mTileSize = 16 kernels when qSeqLen <= 16.
+            unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
+            unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
             unsigned int nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, mTileSize);
             int const* maskPtr = xqaParams.spec_decoding_packed_mask;
             int const* cuQSeqLens = launchParams.cu_seq_lens;

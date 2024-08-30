@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -32,13 +33,17 @@ enum class AttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL = 1,
+    // Only attend to the previous tokens in a fixed-length window.
+    SLIDING_WINDOW_CAUSAL = 2,
     // See ChatGLM-6B mask.
-    BIDIRECTIONAL = 2,
+    BIDIRECTIONAL = 3,
     // See GLM-10B mask.
     // TODO: merge this mask into BIDIRECTIONAL
-    BIDIRECTIONALGLM = 3,
+    BIDIRECTIONALGLM = 4,
     // For Phi-3-small model
-    BLOCKSPARSE = 4,
+    BLOCKSPARSE = 5,
+    // The custom mask input.
+    CUSTOM_MASK = 6,
 };
 
 enum class PositionEmbeddingType : int8_t
@@ -95,8 +100,14 @@ struct BuildDecoderInfoParams
     int* seqQOffsets;
     // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
     int* seqKVOffsets;
-    // The number of padded tokens in the corresponding padded tensor before the current token. Shape: [numTokens].
+    // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
+    // [numTokens].
     int* paddingOffsets;
+    // The number of padded tokens in the corresponding padded tensor before the current token, for Encoder. Shape:
+    // [numTokens].
+    int* encoderPaddingOffsets;
+    // The offsets to the 1st row in each sequence of packed mask buffer. Shape: [batchSize+1].
+    int* packedMaskRowOffsets;
 
     // The mask to mark invalid tokens in Attention - that's not used by the plugins as it can be
     // computed on-the-fly. When it's not needed, simply use nullptr.
@@ -111,12 +122,24 @@ struct BuildDecoderInfoParams
     // The fmha tile counter ptr (set to 0 before fmha).
     uint32_t* fmhaTileCounter;
 
+    // Scales for fmha only.
+    // The scale to dequant Qkv input.
+    float const* dequantScaleQkv;
+    // The scale to quant O output.
+    float const* quantScaleO;
+    // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
+    float fmhaHostBmm1Scale;
+    // The scale after fmha bmm1.
+    float* fmhaBmm1Scale;
+    // The scale after fmha bmm2.
+    float* fmhaBmm2Scale;
+
     // The number of sequences in the batch.
     int batchSize;
-    // The maximum query length of a sequence; it includes input and output.
+    // The maximum query length of a sequence for Decoder (max_input_length), N for ctx phase, 1 for gen phase.
     int maxQSeqLength;
-    // Whether remove the input padding or not.
-    bool removePadding;
+    // The maximum query length of a sequence for Encoder, for cross attention (cross_qkv_length).
+    int maxEncoderQSeqLength;
     // The kv cache capacity.
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
@@ -157,13 +180,20 @@ struct BuildDecoderInfoParams
            << *(runtime::ITensor::wrap(
                   (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
            << std::endl;
+        if (encoderPaddingOffsets != nullptr)
+        {
+            ss << "encoderPaddingOffsets: "
+               << *(runtime::ITensor::wrap((void*) encoderPaddingOffsets, nvinfer1::DataType::kINT32,
+                      runtime::ITensor::makeShape({batchSize})))
+               << std::endl;
+        }
         ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
         ss << "seqQLengths: " << seqQLengths << std::endl;
         ss << "seqKVLengths: " << seqKVLengths << std::endl;
         ss << "fmhaTileCounter: " << fmhaTileCounter << std::endl;
         ss << "batchSize: " << batchSize << std::endl;
         ss << "maxQSeqLength: " << maxQSeqLength << std::endl;
-        ss << "removePadding: " << std::boolalpha << removePadding << std::endl;
+        ss << "maxEncoderQSeqLength: " << maxEncoderQSeqLength << std::endl;
         ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
         ss << "sinkTokenLength: " << sinkTokenLength << std::endl;
         ss << "numTokens: " << numTokens << std::endl;

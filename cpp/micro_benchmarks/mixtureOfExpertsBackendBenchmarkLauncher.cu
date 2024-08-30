@@ -436,6 +436,16 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         int bias = get_or("bias", 0);
         TLLM_CHECK_WITH_INFO(world_rank < tp_size * ep_size, "Rank is out of bounds of tp*ep");
 
+        auto get_range = [&](std::string name, int min = 1, int max = INT32_MAX)
+        {
+            auto val = run_config.at(name).get<int>();
+            if (val < min || val > max)
+            {
+                throw std::invalid_argument(name + " must be a positive integer");
+            }
+            return val;
+        };
+
         for (auto t1 : tactic_ids1)
         {
             // tactic_ids2 will have one dummy value if has_tactic_ids2 = false
@@ -444,17 +454,17 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
                 if (!has_tactic_ids2)
                     t2 = t1;
 
-                benchmark->Args({num_experts,                //
-                    run_config.at("k").get<int>(),           //
-                    run_config.at("hidden_size").get<int>(), //
-                    run_config.at("inter_size").get<int>(),  //
-                    tp_size, ep_size, world_rank,            //
-                    run_config.at("num_tokens").get<int>(),  //
-                    bias,                                    //
-                    run_config.at("act_fn").get<int>(),      //
-                    run_config.at("norm_mode").get<int>(),   //
-                    t1,                                      //
-                    t2,                                      //
+                benchmark->Args({num_experts,                                                      //
+                    get_range("k"),                                                                //
+                    get_range("hidden_size"),                                                      //
+                    get_range("inter_size"),                                                       //
+                    tp_size, ep_size, world_rank,                                                  //
+                    get_range("num_tokens"),                                                       //
+                    bias,                                                                          //
+                    get_range("act_fn", 0, (int) tensorrt_llm::ActivationType::Identity),          //
+                    get_range("norm_mode", 0, (int) MOEExpertScaleNormalizationMode::RENORMALIZE), //
+                    t1,                                                                            //
+                    t2,                                                                            //
                     *routing_config});
             }
         }
@@ -602,7 +612,7 @@ void help()
            "- \"bias\" - If bias should be used, 0 = no bias, 1 = bias\n"
            "- \"act_fn\" - The enum value of the activation function. See\n"
            "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
-           "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM. See\n"
+           "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM, 2 = SPARSE_MIXER. See\n"
            "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
            "- \"tactic_id, tactic_id1, tactic_id2\"\n"
            "The config for the CUTLASS GEMM. tactic_id sets the same tactic for both to the same tactic (except in "

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/decodingOutput.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
@@ -73,14 +74,18 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt)
+        std::optional<RequestIdType> clientId = std::nullopt,
+        executor::PriorityType priority = executor::Request::kDefaultPriority,
+        std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderOutputLength = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -93,6 +98,7 @@ public:
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
+        , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
         , mEmbeddingBias(std::move(embeddingBias))
         , mBadWordsList(std::move(badWordsList))
@@ -102,6 +108,7 @@ public:
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
+        , mLookaheadConfig(std::move(lookaheadConfig))
         , mContextChunkSize(std::nullopt)
         , mContextCurrentPosition(0)
         , mLogProbs(samplingConfig.beamWidth)
@@ -116,8 +123,12 @@ public:
         , mEncoderTokens(std::move(encoderInputTokens))
         , mReturnEncoderOutput(returnEncoderOutput)
         , mDecodingIter(0)
+        , mPriority(priority)
+        , mFinishReasons(samplingConfig.beamWidth)
+        , mEncoderInputFeatures(std::move(encoderInputFeatures))
+        , mEncoderOutputLength(encoderOutputLength)
     {
-        if (mEncoderTokens.has_value())
+        if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
             mState = REQUEST_STATE_ENCODER_INIT;
         }
@@ -135,6 +146,7 @@ public:
         , mClientId(req.getClientId())
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
+        , mNumPreDecodedTokens(mSamplingConfig.beamWidth, 0)
         , mMaxSentTokenLen(mPromptLen)
         , mEmbeddingBias(std::nullopt)
         , mBadWordsList(std::nullopt)
@@ -144,6 +156,7 @@ public:
         , mLoraTaskId(std::nullopt)
         , mLoraWeights(std::nullopt)
         , mLoraConfig(std::nullopt)
+        , mLookaheadConfig(std::nullopt)
         , mContextChunkSize(std::nullopt)
         , mContextCurrentPosition(0)
         , mLogProbs(mSamplingConfig.beamWidth)
@@ -158,8 +171,12 @@ public:
         , mEncoderTokens(std::nullopt)
         , mReturnEncoderOutput(req.getOutputConfig().returnEncoderOutput)
         , mDecodingIter(0)
+        , mPriority(req.getPriority())
+        , mFinishReasons(mSamplingConfig.beamWidth)
+        , mContextPhaseParams(req.getContextPhaseParams())
+        , mEncoderOutputLength(req.getEncoderOutputLength())
     {
-        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnAllGeneratedTokens == false)
+        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && !mReturnAllGeneratedTokens)
         {
             TLLM_LOG_WARNING(
                 "Setting mReturnAllGeneratedTokens to True since streaming AND beam search are done simultaneously. "
@@ -169,10 +186,22 @@ public:
                 "length).");
             mReturnAllGeneratedTokens = true;
         }
-        if (req.getEncoderInputTokenIds())
+        if (mIsStreaming && mSamplingConfig.beamWidth > 1 && mReturnGenerationLogits == true)
+        {
+            TLLM_LOG_WARNING(
+                "Returning generation logits when streaming is enabled and beamWidth > 1 is not allowed. "
+                "This is because the logits may appear in irrelevant order when the beams are gathered, "
+                "since logits are not. Disabling returnGenerationLogits.");
+            mReturnGenerationLogits = false;
+        }
+
+        if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
         {
             mState = REQUEST_STATE_ENCODER_INIT;
-            mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
+            if (req.getEncoderInputTokenIds().has_value())
+            {
+                mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
+            }
         }
         if (req.getEmbeddingBias())
         {
@@ -216,6 +245,11 @@ public:
             }
         }
 
+        auto lookaheadConfig = req.getLookaheadConfig();
+        if (lookaheadConfig)
+        {
+        }
+
         auto externalDraftTokensConfig = req.getExternalDraftTokensConfig();
         if (externalDraftTokensConfig)
         {
@@ -229,14 +263,24 @@ public:
             // NOTE: Draft acceptance threshold is stored in mSamplingConfig
         }
 
+        auto const& encoderInputFeatures = req.getEncoderInputFeatures();
+        if (encoderInputFeatures.has_value())
+        {
+            mEncoderInputFeatures = executor::detail::toITensor(encoderInputFeatures.value());
+        }
+        else
+        {
+            mEncoderInputFeatures = std::nullopt;
+        }
+
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt)
     {
-        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderLen() > maxEncoderInputLen.value()),
-            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderLen(),
+        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
+            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
             maxEncoderInputLen.value());
 
         if (mPromptLen > maxInputLen)
@@ -292,12 +336,27 @@ public:
         mExcludeInputFromOutput = exclude;
     }
 
+    /// @brief Get the params of the context
+    /// @return The params of the context
+    std::optional<executor::ContextPhaseParams> const& getContextPhaseParams() const noexcept
+    {
+        return mContextPhaseParams;
+    }
+
+    /// @brief Get the state params of the context
+    /// @return The state params of the context
+    executor::ContextPhaseState const& getContextPhaseState() const
+    {
+        TLLM_CHECK(mContextPhaseParams.has_value());
+        return *static_cast<executor::ContextPhaseState const*>(mContextPhaseParams.value().getState());
+    }
+
     /// @brief Get total number of tokens for this req (prompt + generated)
     /// @param beam The beam index
     /// @return  The number of tokens
     [[nodiscard]] SizeType32 getNumTokens(SizeType32 beam) const
     {
-        return mTokens.at(beam).size();
+        return mTokens.at(beam).size() - mNumPreDecodedTokens[beam];
     }
 
     /// @brief Get max number of tokens across all beams
@@ -307,7 +366,7 @@ public:
         SizeType32 maxTokens = 0;
         for (SizeType32 beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
         {
-            maxTokens = std::max(maxTokens, static_cast<SizeType32>(mTokens.at(beam).size()));
+            maxTokens = std::max(maxTokens, getNumTokens(beam));
         }
         return maxTokens;
     }
@@ -343,12 +402,36 @@ public:
         return mEncoderTokens;
     }
 
-    /// @brief Get the number of input tokens to encoder
-    /// @return The number of encoder input tokens.
-    [[nodiscard]] SizeType32 getEncoderLen() const
+    /// @brief Get length of encoder input (could be tokens or features length)
+    /// @return An integer.
+    [[nodiscard]] SizeType32 getEncoderInputLen() const
     {
-        TLLM_CHECK_WITH_INFO(getEncoderTokens().has_value(), "Encoder tokens are not given");
-        return getEncoderTokens().value()->size();
+        if (mEncoderInputFeatures.has_value())
+        {
+            return getEncoderInputFeatures()->getShape().d[0];
+        }
+        else if (getEncoderTokens().has_value())
+        {
+            return getEncoderTokens().value()->size();
+        }
+        else
+        {
+            TLLM_THROW("GenericLlmRequest::getEncoderInputLen - Do not have encoder length!");
+        }
+    }
+
+    /// @brief Get length of encoder output. Fall back to encoder input length if not present
+    /// @return An integer.
+    [[nodiscard]] SizeType32 getEncoderOutputLen() const
+    {
+        if (mEncoderOutputLength.has_value())
+        {
+            return mEncoderOutputLength.value();
+        }
+        else
+        {
+            return getEncoderInputLen();
+        }
     }
 
     /// @brief Get the draft tokens
@@ -379,20 +462,22 @@ public:
         return getMaxBeamNumTokens() - mPromptLen;
     }
 
-    /// @brief Add new generated tokens to the vector of tokens
+    /// @brief Add new generated tokens to the vector of tokens and set mLastTokens
     /// @param token The token to add
     /// @param beam The beam to which to add the new token
     void addNewToken(TokenIdType token, SizeType32 beam)
     {
+        mLastTokens[beam] = token;
         mTokens.at(beam).push_back(token);
     }
 
-    /// @brief Add new generated tokens to the vector of tokens
+    /// @brief Add new generated tokens to the vector of tokens and set mLastTokens
     /// @param beamTokens A vector containing the tokens to add for each beam index
     ///                   beamTokens is expected to be of size beamWidth
     void addNewTokens(VecTokens const& beamTokens)
     {
         assert(static_cast<size_t>(mSamplingConfig.beamWidth) == beamTokens.size());
+        mLastTokens = beamTokens;
         for (std::size_t beam = 0; beam < beamTokens.size(); ++beam)
         {
             auto const outputId = beamTokens[beam];
@@ -400,7 +485,15 @@ public:
         }
     }
 
-    /// @brief Sets the generated tokens for all beams. Erases all previous generated tokens.
+    /// @brief Set the number of pre-decoded tokens
+    /// @param num_tokens The number of pre-decoded tokens
+    /// @param beam The beam to which to set the number of pre-decoded tokens
+    void setNumPreDecodedTokens(SizeType32 num_tokens, SizeType32 beam)
+    {
+        mNumPreDecodedTokens[beam] = num_tokens;
+    }
+
+    /// @brief Sets the generated tokens for all beams after gatherTree. Erases all previous generated tokens.
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {
@@ -411,6 +504,18 @@ public:
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beam].begin(), generatedBeamTokens[beam].end());
         }
+    }
+
+    /// @brief Return a vector of the last-generated tokens of shape [num_beams]
+    [[nodiscard]] VecTokens const& getLastTokens()
+    {
+        return mLastTokens;
+    }
+
+    /// @brief Return the last-generated token of from a particular beam
+    [[nodiscard]] TokenIdType const& getLastTokens(SizeType32 beam)
+    {
+        return mLastTokens[beam];
     }
 
     /// @brief Pause a request by moving the generated tokens to the prompt
@@ -451,7 +556,8 @@ public:
         }
 
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
-        mState = mEncoderTokens.has_value() ? REQUEST_STATE_ENCODER_INIT : REQUEST_STATE_CONTEXT_INIT;
+        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? REQUEST_STATE_ENCODER_INIT
+                                                                     : REQUEST_STATE_CONTEXT_INIT;
         mContextCurrentPosition = 0;
         mContextChunkSize = std::nullopt;
         mSeqSlot.reset();
@@ -521,6 +627,21 @@ public:
     void clearLoraConfig()
     {
         mLoraConfig = std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<executor::LookaheadDecodingConfig> getLookaheadConfig() const
+    {
+        return mLookaheadConfig;
+    }
+
+    void setLookaheadConfig(executor::LookaheadDecodingConfig config)
+    {
+        mLookaheadConfig = config;
+    }
+
+    void clearLookaheadConfig()
+    {
+        mLookaheadConfig = std::nullopt;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const
@@ -639,6 +760,11 @@ public:
         return mEncoderOutputHost;
     }
 
+    [[nodiscard]] TensorPtr const getEncoderInputFeatures() const
+    {
+        return mEncoderInputFeatures.value_or(nullptr);
+    }
+
     void setEncoderOutputHost(TensorPtr encoderOutputHost)
     {
         mEncoderOutputHost = std::move(encoderOutputHost);
@@ -647,7 +773,7 @@ public:
     void allocEncoderOutputHost(SizeType32 encoderHiddenSize, nvinfer1::DataType dataType)
     {
         mEncoderOutputHost = runtime::BufferManager::pinned(
-            runtime::ITensor::makeShape({getEncoderLen(), encoderHiddenSize}), dataType);
+            runtime::ITensor::makeShape({getEncoderOutputLen(), encoderHiddenSize}), dataType);
     }
 
     [[nodiscard]] TensorPtr const& getEncoderOutput() const noexcept
@@ -696,11 +822,21 @@ public:
         mIsStreaming = isStreaming;
     }
 
+    void setPriority(executor::PriorityType priority) noexcept
+    {
+        mPriority = priority;
+    }
+
     void setReturnAllGeneratedTokens(bool const returnAllGeneratedTokens)
     {
         TLLM_CHECK_WITH_INFO(!mIsStreaming || mSamplingConfig.beamWidth == 1 || returnAllGeneratedTokens,
             "returnAllGeneratedTokens must be true if streaming AND beam search are used.");
         mReturnAllGeneratedTokens = returnAllGeneratedTokens;
+    }
+
+    [[nodiscard]] bool getReturnAllGeneratedTokens()
+    {
+        return mReturnAllGeneratedTokens;
     }
 
     void setReturnContextLogits(bool const returnContextLogits)
@@ -715,19 +851,14 @@ public:
 
     void setReturnGenerationLogits(bool const returnGenerationLogits)
     {
+        TLLM_CHECK_WITH_INFO(!(mIsStreaming && mSamplingConfig.beamWidth > 1 && returnGenerationLogits),
+            "returnGenerationLogits must be false if streaming AND beam search are used.");
         mReturnGenerationLogits = returnGenerationLogits;
     }
 
-    // Return all generation logits for model w/o draft token
     [[nodiscard]] bool getReturnGenerationLogits() const
     {
-        return mReturnGenerationLogits && (getNumDraftTokens() == 0);
-    }
-
-    // Return accepted tokens logits for target model
-    [[nodiscard]] bool getReturnTargetModelAcceptedLogits() const
-    {
-        return mReturnGenerationLogits && (getNumDraftTokens() > 0);
+        return mReturnGenerationLogits;
     }
 
     [[nodiscard]] TensorPtr const& getContextLogitsHost() const
@@ -735,6 +866,7 @@ public:
         return mContextLogitsHost;
     }
 
+    /// @param contextLogitsHost Expected shape [promtLen, vocabSizePadded]
     void setContextLogitsHost(TensorPtr contextLogitsHost)
     {
         mContextLogitsHost = std::move(contextLogitsHost);
@@ -751,6 +883,9 @@ public:
         return mGenerationLogitsHost;
     }
 
+    /// @param generationLogitsHost Expected shape
+    /// * [beamWidth, maxNewTokens, vocabSizePadded] for non-speculative decoding
+    /// * [1, numDraftTokens + 1, vocabSizePadded] for speculative decoding
     void setGenerationLogitsHost(TensorPtr generationLogitsHost)
     {
         mGenerationLogitsHost = std::move(generationLogitsHost);
@@ -758,14 +893,27 @@ public:
 
     void allocGenerationLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
-        mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-            runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}), logitsDataType);
+        if (mIsStreaming)
+        {
+            // If streaming mode, the complete generation logits shape will be [1, beamWidth, vocabSizePadded],
+            // or [allGeneratedTokens, beamWidth, vocabSizePadded] if mReturnAllGeneratedTokens is True.
+            // This could reduce unnecessary format conversions and allows the data to be returned directly.
+            mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
+                runtime::ITensor::makeShape({mMaxNewTokens, mSamplingConfig.beamWidth, vocabSizePadded}),
+                logitsDataType);
+        }
+        else
+        {
+            mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
+                runtime::ITensor::makeShape({mSamplingConfig.beamWidth, mMaxNewTokens, vocabSizePadded}),
+                logitsDataType);
+        }
     }
 
     void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
     {
         mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-            runtime::ITensor::makeShape({getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
+            runtime::ITensor::makeShape({1, getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
     }
 
     [[nodiscard]] std::vector<TensorPtr> const& getGenerationLogitsFragments() const
@@ -820,6 +968,11 @@ public:
         return isContextInitState() && !mContextChunkSize;
     }
 
+    void setContextCurrentPosition(SizeType32 contextCurrentPosition)
+    {
+        mContextCurrentPosition = contextCurrentPosition;
+    }
+
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
     /// or end of the context is returned.
     [[nodiscard]] SizeType32 getContextCurrentPosition() const noexcept
@@ -864,6 +1017,11 @@ public:
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
         return isFullContextRequest() || getContextCurrentPosition() == 0;
+    }
+
+    [[nodiscard]] executor::PriorityType priority() const noexcept
+    {
+        return mPriority;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
@@ -963,25 +1121,26 @@ public:
 
                 if (getReturnGenerationLogits())
                 {
-                    result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
-                }
-
-                if (getReturnTargetModelAcceptedLogits())
-                {
-                    auto targetModelAcceptedTokenLogitsShape = getGenerationLogitsHost()->getShape();
-                    TLLM_CHECK(targetModelAcceptedTokenLogitsShape.nbDims == 2);
-                    auto numAcceptedToken = targetModelAcceptedTokenLogitsShape.d[0];
-                    auto vocabSizePadded = targetModelAcceptedTokenLogitsShape.d[1];
-                    // Align the shape of accepted token logits and generation logits
-                    TensorPtr targetModelAcceptedTokenLogitsHostView = runtime::ITensor::view(
-                        getGenerationLogitsHost(), runtime::ITensor::makeShape({1, numAcceptedToken, vocabSizePadded}));
-                    result.generationLogits = executor::detail::ofITensor(targetModelAcceptedTokenLogitsHostView);
+                    if (isStreaming())
+                    {
+                        auto startGenTokenPos = startTokenPos - getOrigPromptLen();
+                        TensorPtr generationLogitsHostCurrentStep
+                            = runtime::ITensor::slice(getGenerationLogitsHost(), startGenTokenPos, maxNbTokensOut);
+                        result.generationLogits = executor::detail::ofITensor(generationLogitsHostCurrentStep);
+                    }
+                    else
+                    {
+                        result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
+                    }
                 }
 
                 if (getReturnEncoderOutput())
                 {
                     result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
                 }
+
+                result.finishReasons = mFinishReasons;
+                result.decodingIter = mDecodingIter;
 
                 // Update position of last sent response
                 setMaxSentTokenLen(maxNbTokens);
@@ -994,6 +1153,11 @@ public:
         {
             return std::nullopt;
         }
+    }
+
+    void setFinishedReason(executor::FinishReason reason, SizeType32 beam)
+    {
+        mFinishReasons.at(beam) = reason;
     }
 
     RequestIdType mRequestId;
@@ -1014,8 +1178,18 @@ public:
 protected:
     bool mIsStreaming;
 
+    // A list of tokens generated at the current step.
+    // Used to pass the decoded tokens as the input to the next step.
+    // `mLastTokens[beam] != mTokens.back()[beam]` for streaming + beam search
+    // as `mTokens` will be overwritten by the gathered tokens.
+    VecTokens mLastTokens;
     BeamTokens mTokens;
     SizeType32 mOrigPromptLen;
+    // A list of numbers of pre-deocded tokens on the last PP rank when using pipeline parallelism.
+    // It is introduced as a WAR to solve the hanging problem caused by overestimating the used KV cache on the last PP
+    // rank (because new tokens are decoded earlier). By excluding the numbers of pre-decoded tokens, the used KV cache
+    // can be estimated correctly.
+    std::vector<SizeType32> mNumPreDecodedTokens;
     // Number of tokens already in KV cache before context phase.
     // A value > 0 indicates cached KV cache blocks were reused.
     // Up to inputLen - 1 tokens can be reused.
@@ -1032,6 +1206,7 @@ protected:
     std::optional<LoraTaskIdType> mLoraTaskId;
     std::optional<TensorPtr> mLoraWeights;
     std::optional<TensorPtr> mLoraConfig;
+    std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig;
 
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
     // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
@@ -1067,12 +1242,21 @@ protected:
     TensorPtr mEncoderOutputHost;
 
     SizeType32 mDecodingIter;
+    executor::PriorityType mPriority;
+    std::vector<executor::FinishReason> mFinishReasons;
+    std::optional<executor::ContextPhaseParams> mContextPhaseParams;
+
+    std::optional<TensorPtr> mEncoderInputFeatures; // Input features of encoder for multimodal models
+    std::optional<SizeType32>
+        mEncoderOutputLength; // For some models like Whisper, encoder output shape cannot be inferred from encoder
+                              // input shape due to downsampling. Thus this is needed for setting buffer sizes correctly
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
+        mLastTokens = VecTokens(mSamplingConfig.beamWidth);
 
         if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
             || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
@@ -1138,20 +1322,22 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
+        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
-        std::optional<RequestIdType> clientId = std::nullopt)
+        std::optional<RequestIdType> clientId = std::nullopt,
+        executor::PriorityType priority = executor::Request::kDefaultPriority)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
-            returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
-            excludeInputFromOutput, std::move(logitsPostProcessor), applyLogitsPostProcessorBatched,
-            std::move(encoderInputTokens), returnEncoderOutput, clientId)
+            std::move(lookaheadConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
+            std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
+            applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority)
     {
     }
 
@@ -1162,6 +1348,7 @@ public:
     {
         mLogitsPostProcessor = std::move(logitsPostProcessor);
         mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
+        mLookaheadConfig = Request.getLookaheadConfig();
     }
 
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)

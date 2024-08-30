@@ -87,7 +87,7 @@ class TestGPTNeoX(unittest.TestCase):
             "num_attention_heads": num_heads,
             "hidden_size": hidden_size,
             "vocab_size": vocab_size,
-            "position_embedding_type": "learned_absolute",
+            "position_embedding_type": "rope_gpt_neox",
             "max_position_embeddings": max_position_embeddings,
             "rotary_emb_base": 10000,
             "rotary_pct": gpt_config.rotary_pct,
@@ -287,6 +287,8 @@ class TestGPTNeoX(unittest.TestCase):
         perf_knob_tensor_size = 16
         context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         ctx_buffer = {
             'input_ids': ctx_ids,
@@ -392,6 +394,8 @@ class TestGPTNeoX(unittest.TestCase):
 
         gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                               dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         step1_buffer = {
             'input_ids': step1_id,

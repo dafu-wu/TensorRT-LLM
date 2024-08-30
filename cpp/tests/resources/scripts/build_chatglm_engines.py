@@ -66,7 +66,6 @@ def build_engine(ckpt_dir: str,
             "--remove_input_padding=enable",
             "--paged_kv_cache=enable",
             "--context_fmha=enable",
-            "--context_fmha_fp32_acc=enable",
             "--use_paged_context_fmha=enable",
         ])
     else:
@@ -77,8 +76,7 @@ def build_engine(ckpt_dir: str,
 
     if is_chatglm_6b_or_glm_10b:
         print("Disable Context FMHA for ChatGLM-6B and GLM-10B")
-        build_cmd.extend(
-            ["--context_fmha=disable", "--context_fmha_fp32_acc=disable"])
+        build_cmd.extend(["--context_fmha=disable"])
 
     run_command(build_cmd)
 
@@ -134,7 +132,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
 
         model_spec_obj = model_spec.ModelSpec('input_tokens.npy',
                                               _tb.DataType.HALF)
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.CONTINUOUS)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
         model_spec_obj.use_gpt_plugin()
         engine_dir = Path(
             model_dir
@@ -144,7 +142,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
         build_engine(ckpt_dir, engine_dir, False, is_chatglm_6b_or_glm_10b)
 
         model_spec_obj.use_packed_input()
-        model_spec_obj.set_kv_cache_type(model_spec.KVCacheType.PAGED)
+        model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         engine_dir = Path(
             model_dir
         ) / "rt_engine" / model_name / model_spec_obj.get_model_path(

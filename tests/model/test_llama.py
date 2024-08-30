@@ -86,8 +86,9 @@ class TestLLaMA(unittest.TestCase):
 
             # Initialize model
             config = tensorrt_llm.models.LLaMAConfig.from_dict(config)
-            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             weights = load_weights_from_hf_model(hf_llama, config)
+
+            tensorrt_llm_llama = tensorrt_llm.models.LLaMAForCausalLM(config)
             tensorrt_llm_llama.load(weights)
             optimize_model(tensorrt_llm_llama, **opt_flags)
 
@@ -207,14 +208,12 @@ class TestLLaMA(unittest.TestCase):
              dict()))  # GQA
         test_cases.append((False, True, ContextFMHAType.enabled_with_fp32_acc,
                            False, 'float16', 4, 'silu', dict()))  # GQA
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'float16', 2, 'gelu', {
-                               "use_fused_mlp": True
-                           }))  # GQA
-        test_cases.append((False, True, ContextFMHAType.disabled, False,
-                           'float16', 2, 'silu', {
-                               "use_fused_mlp": True
-                           }))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'gelu',
+             dict()))  # GQA
+        test_cases.append(
+            (False, True, ContextFMHAType.disabled, False, 'float16', 2, 'silu',
+             dict()))  # GQA
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
@@ -328,6 +327,8 @@ class TestLLaMA(unittest.TestCase):
         # runtime_perf_knobs is not used in context phase
         context_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                                   dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         ctx_buffer = {
             'input_ids': ctx_ids,
@@ -398,6 +399,8 @@ class TestLLaMA(unittest.TestCase):
             gen_last_token_ids = torch.cumsum(gen_last_token_ids, dim=0).int()
         gen_runtime_perf_knobs = torch.tensor([-1] * perf_knob_tensor_size,
                                               dtype=torch.int64)
+        if context_fmha_flag == ContextFMHAType.enabled_with_fp32_acc:
+            gen_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
         step1_buffer = {
             'input_ids': step1_id,
@@ -548,7 +551,6 @@ class TestLLaMA(unittest.TestCase):
             },
             'use_parallel_embedding': use_parallel_embedding,
             'embedding_sharding_dim': embedding_sharding_dim,
-            'use_fused_mlp': False,
         }
 
         config = PretrainedConfig.from_dict(config)

@@ -23,7 +23,7 @@ from typing import List, Optional, Tuple
 
 import tensorrt as trt
 
-from .._ipc_utils import IpcMemory
+from .._ipc_utils import IpcMemory, can_access_peer
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -158,9 +158,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     # Features
     _context_fmha: bool = field(default=True, init=False)
-    _context_fmha_fp32_acc: bool = field(
+    _bert_context_fmha_fp32_acc: bool = field(
         default=False, init=False)  # will use fp16 if disabled
-    _paged_kv_cache: bool = field(default=True, init=False)
+    _paged_kv_cache: Optional[bool] = field(default=None, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
     _reduce_fusion: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
@@ -170,12 +170,15 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _multiple_profiles: bool = field(default=False, init=False)
     _paged_state: bool = field(default=True, init=False)
     _streamingllm: bool = field(default=False, init=False)
+    _manage_weights: bool = field(default=False, init=False)
+    _use_fused_mlp: bool = field(default=True, init=False)
 
     def update_from_dict(self, config: dict):
         for name in config.keys():
             if hasattr(self, name):
                 value_to_be_update = config[name]
-                if isinstance(getattr(self, name), bool):
+                if isinstance(getattr(self, name),
+                              bool) or name == 'paged_kv_cache':
                     if value_to_be_update == "enable":
                         value_to_be_update = True
                     elif value_to_be_update == "disable":
@@ -202,7 +205,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     def to_legacy_setting(self):
         '''Legacy setting means that all of the plugins and features are
-        disabled, this needed for the legacy `build.py` script, which will be
+        disabled, this is needed for the legacy `build.py` script, which will be
         migrated to the centralized building script `tensorrt_llm/commands/build.py`.
 
         After the migration is done, this function may or may not be deleted.
@@ -214,12 +217,12 @@ class PluginConfig(metaclass=PluginConfigMeta):
                 continue
             if field.type in (str, Optional[str]):
                 setattr(self, field_name, None)
-            elif field.type == bool:
+            elif field.type == bool or field_name == 'paged_kv_cache':
                 setattr(self, field_name, False)
 
     @property
     def context_fmha_type(self):
-        if self.context_fmha_fp32_acc:
+        if self.bert_context_fmha_fp32_acc:
             return ContextFMHAType.enabled_with_fp32_acc
         elif self.context_fmha:
             return ContextFMHAType.enabled
@@ -230,13 +233,13 @@ class PluginConfig(metaclass=PluginConfigMeta):
     def context_fmha_type(self, value):
         if value == ContextFMHAType.disabled:
             self.context_fmha = False
-            self.context_fmha_fp32_acc = False
+            self.bert_context_fmha_fp32_acc = False
         else:
             self.context_fmha = True
             if value == ContextFMHAType.enabled:
-                self.context_fmha_fp32_acc = False
+                self.bert_context_fmha_fp32_acc = False
             elif value == ContextFMHAType.enabled_with_fp32_acc:
-                self.context_fmha_fp32_acc = True
+                self.bert_context_fmha_fp32_acc = True
 
     def set_smooth_quant_plugins(self, dtype: str = "auto"):
         self.smooth_quant_gemm_plugin = dtype
@@ -285,8 +288,7 @@ cli_plugin_args = [
 
     # Features
     "context_fmha",
-    "context_fmha_fp32_acc",
-    "paged_kv_cache",
+    "bert_context_fmha_fp32_acc",
     "remove_input_padding",
     "enable_xqa",
     "tokens_per_block",
@@ -295,11 +297,12 @@ cli_plugin_args = [
     "multiple_profiles",
     "paged_state",
     "streamingllm",
-    "reduce_fusion"
+    "reduce_fusion",
+    "use_fused_mlp",
 ]
 
 
-def add_plugin_argument(parser):
+def add_plugin_argument(parser: argparse.ArgumentParser):
     plugin_config = PluginConfig()
     for field in fields(plugin_config):
         # Remove prefix "_" of the storage name
@@ -336,12 +339,6 @@ class CustomAllReduceHelper:
         Globally visible class to help usage of custom_all_reduce plugin.
         Provides the following utilities:
 
-        gen_id: int
-            Used for synchronization with custom kernels. Plugins instances MUST have the same
-            id across GPUs. I.e.: GPU#0's allreduce after MLP at layer i must have the same id as
-            GPU#1, GPU#2... Also, ids MUST be unique per model. There should not be two allreduce instances
-            in GPU#0 that have the same id.
-
         workspace: Tensor
             When using CUSTOM or AUTO mode, a tensor containing pointers to memory
             visible to all GPUs. It should be 3 pointers per TP rank -
@@ -349,26 +346,19 @@ class CustomAllReduceHelper:
             It must be initialized using IpcMemory class.
 
         Usage:
-            - Use `init_all_reduce_helper` to reset the id counter. This must be done in main model class.
             - Set custom_all_reduce_helper.workspace with the required tensor.
               Then, each instance of allreduce will reference that tensor automatically.
     """
     POINTERS_PER_RANK = 4
 
     def __init__(self) -> None:
-        self.current_id: int = 1
         self.workspace: Optional[Tensor] = None
-
-    def gen_id(self) -> int:
-        result = self.current_id
-        self.current_id += 1
-        return result
 
     def set_workspace_tensor(self,
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
         from ..functional import Tensor
-        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 1
 
         dim_range = None
         if num_profiles is not None:
@@ -392,12 +382,17 @@ class CustomAllReduceHelper:
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size)
+        is_p2p_supported = can_access_peer(mapping)
+        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
+                                     is_p2p_supported)
+        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,
+                                     is_p2p_supported)
         ipc_barriers_in = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
         ipc_barriers_out = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2)
+            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
+            is_p2p_supported)
         buffers = [
             ipc_buffers_ping,
             ipc_buffers_pong,
@@ -407,7 +402,7 @@ class CustomAllReduceHelper:
 
         return buffers, torch.tensor(
             ipc_buffers_ping.serialize() + ipc_buffers_pong.serialize() +
-            ipc_barriers_in.serialize() + ipc_barriers_out.serialize(),
+            ipc_barriers_in.serialize() + ipc_barriers_out.serialize() + [0],
             dtype=torch.int64,
             device="cpu")
 

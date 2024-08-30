@@ -10,7 +10,6 @@ from diffusion import DiTDiffusionPipeline
 from torchvision.utils import save_image
 
 import tensorrt_llm
-from tensorrt_llm._ipc_utils import set_peer_access
 from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
@@ -37,11 +36,15 @@ class TllmDiT(object):
         self.dtype = config['pretrained_config']['dtype']
 
         rank = tensorrt_llm.mpi_rank()
-        world_size = tp = config['pretrained_config']['mapping'][
-            'world_size']  # Only support TP
+        world_size = config['pretrained_config']['mapping']['world_size']
+        cp_size = config['pretrained_config']['mapping']['cp_size']
+        tp_size = config['pretrained_config']['mapping']['tp_size']
+        pp_size = config['pretrained_config']['mapping']['pp_size']
+        assert pp_size == 1
         self.mapping = tensorrt_llm.Mapping(world_size=world_size,
                                             rank=rank,
-                                            tp_size=tp,
+                                            cp_size=cp_size,
+                                            tp_size=tp_size,
                                             pp_size=1,
                                             gpus_per_node=args.gpus_per_node)
 
@@ -73,7 +76,6 @@ class TllmDiT(object):
         expected_tensor_names = ['latent', 'timestep', 'label', 'output']
 
         if self.mapping.tp_size > 1:
-            set_peer_access(self.mapping)
             self.buffer, self.all_reduce_workspace = CustomAllReduceHelper.allocate_workspace(
                 self.mapping,
                 CustomAllReduceHelper.max_workspace_size_auto(

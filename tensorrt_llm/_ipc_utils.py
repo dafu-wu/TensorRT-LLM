@@ -15,13 +15,13 @@
 import array
 import struct
 import sys
-from contextlib import contextmanager
 from typing import List, Tuple
 
 from cuda import cudart
 from cuda.cudart import cudaError_t
 
 from ._utils import mpi_comm
+from .logger import logger
 from .mapping import Mapping
 
 
@@ -30,16 +30,7 @@ def _raise_if_error(error: cudaError_t):
         raise RuntimeError(error)
 
 
-@contextmanager
-def peer_access(mapping: Mapping):
-    set_peer_access(mapping, True)
-    try:
-        yield
-    finally:
-        set_peer_access(mapping, False)
-
-
-def set_peer_access(mapping: Mapping, enabled: bool = True):
+def can_access_peer(mapping: Mapping) -> bool:
     src_node = mapping.local_rank
     for rank in mapping.tp_group:
         dest_node = mapping.get_local_rank(rank)
@@ -51,20 +42,10 @@ def set_peer_access(mapping: Mapping, enabled: bool = True):
         _raise_if_error(error)
 
         if result == 0:
-            raise RuntimeError(
-                f"Can't enable access between nodes {src_node} and {dest_node}")
-
-        if enabled:
-            cudart.cudaDeviceEnablePeerAccess(dest_node, 0)
-        else:
-            cudart.cudaDeviceDisablePeerAccess(dest_node)
-        error = cudart.cudaGetLastError()[0]
-        if error not in [
-                cudaError_t.cudaSuccess,
-                cudaError_t.cudaErrorPeerAccessAlreadyEnabled,
-                cudaError_t.cudaErrorPeerAccessNotEnabled
-        ]:
-            raise RuntimeError(error)
+            logger.info(
+                f"Cannot access peer device from {src_node} to {dest_node}")
+            return False
+    return True
 
 
 class IpcMemory():
@@ -73,9 +54,9 @@ class IpcMemory():
     # (Max all reduce blocks + 1) * sizeof(int)
     IPC_BARRIERS_SIZE_PER_GPU = (24 + 1) * 4
 
-    def __init__(self, mapping: Mapping, size: int):
+    def __init__(self, mapping: Mapping, size: int, open_ipc: bool = True):
         self.mapping = mapping
-        self.open_ipc = mapping.tp_size <= mapping.gpus_per_node
+        self.open_ipc = open_ipc and mapping.tp_size <= mapping.gpus_per_node
         if self.open_ipc:
             self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(
                 self.mapping, size, True)
@@ -102,7 +83,9 @@ class IpcMemory():
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
         """
-        comm = mpi_comm().Split(mapping.pp_rank, mapping.tp_rank)
+        comm = mpi_comm().Split(
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.tp_rank)
 
         error, local_ptr = cudart.cudaMalloc(size)
         _raise_if_error(error)

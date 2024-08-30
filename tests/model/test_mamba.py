@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 import torch
 from parameterized import parameterized
-from transformers import AutoModelForCausalLM, MambaConfig
+from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -68,13 +68,19 @@ class TestMamba(unittest.TestCase):
             'conv_kernel': hf_config.conv_kernel,
             'use_bias': hf_config.use_bias,
             'mamba_version': 'Mamba1',
+            'mapping': {
+                'world_size': 1,
+                'tp_size': 1,
+                'pp_size': 1
+            },
         }
-        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         if load_mode == 'from_checkpoint':
-            weights = convert_from_hf_checkpoint(model_dir=hf_path, dtype=dtype)
+            weights = convert_from_hf_checkpoint(mamba_config=config,
+                                                 model_dir=hf_path,
+                                                 dtype=dtype)
         else:
             weights = convert_hf_mamba(hf_mamba, rank=0, dtype=dtype)
-
+        config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         tensorrt_llm_mamba = tensorrt_llm.models.MambaForCausalLM(config)
         tensorrt_llm_mamba.load(weights)
         return tensorrt_llm_mamba
@@ -156,6 +162,8 @@ class TestMamba(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_mamba(self, gemm_plugin, mamba_conv1d_plugin, dtype,
                    remove_padding):
+        from transformers import MambaConfig
+
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -360,6 +368,7 @@ class TestMamba(unittest.TestCase):
     ],
                           name_func=unittest_name_func)
     def test_loaders(self, path, load_mode):
+        from transformers import MambaConfig
         model_root = llm_models_root()
         if model_root is None:
             pytest.skip('Skipping since real weights are unavailable.')

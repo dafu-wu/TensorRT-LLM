@@ -1,6 +1,8 @@
 import asyncio
 import atexit
 import datetime
+import json
+import math
 import secrets
 import threading
 import time
@@ -17,6 +19,7 @@ from janus import Queue as AsyncQueue
 
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
+from .builder import Engine
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
@@ -368,7 +371,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
@@ -386,7 +389,7 @@ class GenerationExecutor(ABC):
                 f"on {world_size} ranks.")
 
         worker_kwargs = {
-            "engine_dir": engine_dir,
+            "engine": engine,
             "executor_config": executor_config,
         }
 
@@ -411,7 +414,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
@@ -421,10 +424,15 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self._pending: set = set()
         self.result_queue = None
         self.rank = mpi_rank()
-
-        self.engine = tllm.Executor(engine_dir,
-                                    tllm.ModelType.DECODER_ONLY,
-                                    executor_config=executor_config)
+        if isinstance(engine, Engine):
+            self.engine = tllm.Executor(engine.engine,
+                                        json.dumps(engine.config.to_dict()),
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config)
+        else:
+            self.engine = tllm.Executor(engine,
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config)
         self.awaiter_stop_event = threading.Event()
         self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
                                                daemon=True)
@@ -480,9 +488,28 @@ class ExecutorBindingsWorker(GenerationExecutor):
             for response in self.engine.await_responses(
                     timeout=datetime.timedelta(milliseconds=100)):
                 req_id = response.request_id
+
+                # If the req_id is not returned from enqueue_request in the main thread, wait.
+                # TODO[chunweiy]: use a pending list instead.
+                sleep_interval = 0.01
+                repeat_for_wait = math.ceil(
+                    2 /
+                    sleep_interval)  # We will wait for 2s for a single req_id
+
+                if req_id not in self._results:
+                    for i in range(repeat_for_wait):
+                        time.sleep(sleep_interval)
+                        if req_id in self._results:
+                            break
+                    else:
+                        if req_id not in self._results:
+                            raise RuntimeError(
+                                f"Request ID {req_id} not found in the results queue."
+                            )
+
+                queue = self.return_queue(req_id)
                 if response.has_error():
-                    self.return_queue(req_id).put(
-                        (req_id, None, None, response.error_msg))
+                    queue.put((req_id, None, None, response.error_msg))
                 else:
                     tensors = (
                         response.result.output_token_ids,
@@ -491,9 +518,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
                         response.result.log_probs,
                         response.result.cum_log_probs,
                     )
-                    self.return_queue(req_id).put(
-                        (response.request_id, tensors, response.result.is_final,
-                         None))
+                    queue.put((response.request_id, tensors,
+                               response.result.is_final, None))
                     if response.result.is_final:
                         self._pending.remove(req_id)
 
@@ -659,7 +685,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
     @print_traceback_on_error
     @staticmethod
     def workers_main(
-        engine_dir: Path,
+        engine: Union[Path, Engine],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
@@ -680,7 +706,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # TODO[chunweiy]: fix the non-rank0 process failure
         init_ok = True
         try:
-            executor = ExecutorBindingsWorker(engine_dir, executor_config)
+            executor = ExecutorBindingsWorker(engine, executor_config)
         except Exception as e:
             init_ok = False
             raise e

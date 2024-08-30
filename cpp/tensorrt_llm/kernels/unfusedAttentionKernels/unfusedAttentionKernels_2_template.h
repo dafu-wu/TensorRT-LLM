@@ -373,7 +373,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
         {
             // The index of the token in the batch.
             int const global_token_idx = local_token_idx
-                + (variable_sequence_length ? params.cu_seq_lens[batch_idx] : batch_idx * params.max_input_seq_len);
+                + ((variable_sequence_length && params.remove_padding) ? params.cu_seq_lens[batch_idx]
+                                                                       : batch_idx * params.max_input_seq_len);
             int const cache_seq_len = params.cache_seq_lens[batch_idx];
             int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
             // Chunked attention: takes past_kv_sequence_length into consideration.
@@ -688,8 +689,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
          local_token_idx < seq_len_loop_end; local_token_idx += TOKENS_PER_BLOCK * gridDim.x)
     {
         // The index of the token in the batch.
-        int const global_token_offset
-            = variable_sequence_length ? params.cu_seq_lens[batch_idx] : batch_idx * params.max_input_seq_len;
+        int const global_token_offset = (variable_sequence_length && params.remove_padding)
+            ? params.cu_seq_lens[batch_idx]
+            : batch_idx * params.max_input_seq_len;
         int const cache_seq_len = params.cache_seq_lens[batch_idx];
         int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
         // Chunked attention: takes past_kv_sequence_length into consideration.
@@ -785,15 +787,19 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         auto const channelIdx = head_dim_vec_idx;
         auto const tokenIdxLowerBound = max(cache_seq_len - params.cyclic_kv_cache_len, 0);
         bool const cyclic_kv_cache = cache_seq_len > params.cyclic_kv_cache_len;
-        bool const valid_kv_cache_pos
-            = params.kv_cache_buffer.data != nullptr // In KV-cache-less mode. No need to store KV values
+        bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+        bool const valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
             && (token_idx_in_kv_cache >= tokenIdxLowerBound);
         auto const token_kv_idx
             = cyclic_kv_cache ? (token_idx_in_kv_cache % params.cyclic_kv_cache_len) : token_idx_in_kv_cache;
 
-        auto kDst = reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_kv_idx));
-        auto vDst = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_kv_idx));
-        auto inBlockIdx = params.kv_cache_buffer.getKVLocalIdx(token_kv_idx, kv_head_idx, VECS_PER_HEAD, channelIdx);
+        auto kDst = useKVCache ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_kv_idx))
+                               : (TCache*) (nullptr);
+        auto vDst = useKVCache ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_kv_idx))
+                               : (TCache*) (nullptr);
+        auto inBlockIdx = useKVCache
+            ? params.kv_cache_buffer.getKVLocalIdx(token_kv_idx, kv_head_idx, VECS_PER_HEAD, channelIdx)
+            : int32_t(0);
 
         // Make sure pairs of q or v vecs have been read before write.
         __syncthreads();
