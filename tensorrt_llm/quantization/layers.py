@@ -1716,7 +1716,6 @@ class SmoothQuantAttention(Module):
                 "type", rotary_embedding_scaling.get("rope_type"))
             self.rotary_embedding_scale_type = RotaryScalingType.from_string(
                 rotary_scaling_type)
-
             self.rotary_embedding_scale = rotary_embedding_scaling.get(
                 "factor", 1.0)
 
