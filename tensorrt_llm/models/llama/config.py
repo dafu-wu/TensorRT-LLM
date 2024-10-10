@@ -151,9 +151,14 @@ class LLaMAConfig(PretrainedConfig):
             logger.warning(
                 "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
             dtype = 'float16'
+        hf_architecture = hf_config.architectures[0]
+
+        hf_pad_token_id = getattr(hf_config, "pad_token_id", None)
+        print(f"HF config = {hf_config}")
 
         return cls(
-            architecture='LlamaForCausalLM',
+            architecture=hf_architecture,
+            pad_token_id=hf_pad_token_id,
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,

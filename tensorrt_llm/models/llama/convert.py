@@ -27,7 +27,7 @@ import safetensors
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
@@ -710,7 +710,14 @@ def load_hf_llama(model_dir: str, load_model_on_cpu: bool = False):
         return model.llm
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    model_cls = AutoModelForCausalLM
+    print(hf_config)
+    try:
+        if "SequenceClassification" in hf_config.architectures[0]:
+            model_cls = AutoModelForSequenceClassification
+        else:
+            model_cls = AutoModelForCausalLM
+    except:
+        model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
         model_cls = LlavaForConditionalGeneration
@@ -1262,23 +1269,30 @@ def load_weights_from_hf_model(hf_model,
     if mapping.is_first_pp_rank():
         weights['transformer.vocab_embedding.weight'] = v
 
-    lm_head_weights = get_weight(model_params, 'lm_head', dtype)
+    print(f"Tensorrt config.architecture = {config.architecture}")
+    if "SequenceClassification" in  config.architecture:
+        lm_head_weights = get_weight(model_params, 'score', dtype)
+    else:
+        lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
     if mapping.is_last_pp_rank():
-        if config.vocab_size % mapping.tp_size != 0:
-            # padding
-            vocab_size_padded = pad_vocab_size(config.vocab_size,
-                                               mapping.tp_size)
-            pad_width = vocab_size_padded - config.vocab_size
+        if "SequenceClassification" in  config.architecture:
+            weights['lm_head.weight'] = lm_head_weights 
+        else:
+            if config.vocab_size % mapping.tp_size != 0:
+                # padding
+                vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                                   mapping.tp_size)
+                pad_width = vocab_size_padded - config.vocab_size
 
-            lm_head_weights = torch.nn.functional.pad(lm_head_weights,
-                                                      (0, 0, 0, pad_width),
-                                                      'constant',
-                                                      value=0)
-        weights['lm_head.weight'] = split_matrix_tp(lm_head_weights,
-                                                    mapping.tp_size,
-                                                    mapping.tp_rank,
-                                                    dim=0)
+                lm_head_weights = torch.nn.functional.pad(lm_head_weights,
+                                                          (0, 0, 0, pad_width),
+                                                          'constant',
+                                                          value=0)
+            weights['lm_head.weight'] = split_matrix_tp(lm_head_weights,
+                                                        mapping.tp_size,
+                                                        mapping.tp_rank,
+                                                        dim=0)
         ln_f_w = get_weight(model_params, 'model.norm', dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
 
@@ -1333,7 +1347,15 @@ def quantize(hf_model_dir: str,
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
     assert "llava" not in hf_config.model_type, "Smooth quant llava/vila/llava_next is not supported yet"
-    hf_model = AutoModelForCausalLM.from_pretrained(
+    try:
+        if "SequenceClassification" in hf_config.architectures[0]:
+            model_cls = AutoModelForSequenceClassification
+        else:
+            model_cls = AutoModelForCausalLM
+    except:
+        model_cls = AutoModelForCausalLM
+ 
+    hf_model = model_cls.from_pretrained(
         hf_model_dir,
         device_map='auto' if device != 'cpu' else 'cpu',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,
